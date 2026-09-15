@@ -76,9 +76,10 @@ def mark_synced(url, title, pico_url, bale_msg_id):
     conn.commit()
     conn.close()
 
-def get_playlist_entries():
-    logger.info(f"Extracting playlist entries from: {PLAYLIST_URL}")
-    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", PLAYLIST_URL]
+def get_playlist_entries(url=None):
+    url = url or PLAYLIST_URL
+    logger.info(f"Extracting playlist entries from: {url}")
+    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", url]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if p.returncode != 0 or not p.stdout:
         raise RuntimeError(f"Failed to fetch playlist: {p.stderr[:300]}")
