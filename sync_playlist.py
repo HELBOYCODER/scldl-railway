@@ -24,19 +24,19 @@ HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
 
 PLAYLIST_URL = "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio"
-BALE_TOKEN = "1629720660:c-U5awHAgXHUm7XqzR5HjHa4CMRFGmHBilI"
-BALE_CHAT_ID = "1446119540"
-DB_PATH = "/home/ersaz/scldl-bot/synced_episodes.db"
-LOG_PATH = "/home/ersaz/scldl-bot/sync.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
-    ]
-)
+BALE_TOKEN = os.environ.get("BALE_TOKEN", "1629720660:c-U5awHAgXHUm7XqzR5HjHa4CMRFGmHBilI")
+BALE_CHAT_ID = os.environ.get("BALE_CHAT_ID", "1446119540")
+DB_PATH = os.environ.get("DB_PATH", "/app/data/synced_episodes.db" if os.path.isdir("/app") else "/home/ersaz/scldl-bot/synced_episodes.db")
+LOG_PATH = os.environ.get("LOG_PATH", "/app/data/sync.log" if os.path.isdir("/app") else "/home/ersaz/scldl-bot/sync.log")
+# ensure dirs exist for Railway (/app/data) and legacy Alwaysdata
+for _p in (DB_PATH, LOG_PATH):
+    try: os.makedirs(os.path.dirname(_p), exist_ok=True)
+    except Exception: pass
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+if os.path.isdir(os.path.dirname(LOG_PATH)):
+    try: _log_handlers.append(logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"))
+    except Exception: pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=_log_handlers)
 logger = logging.getLogger("sync-wym")
 
 def init_db():
