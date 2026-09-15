@@ -140,13 +140,11 @@ def worker_loop():
     log.info("Worker thread started")
     while True:
         try:
-            # 1) drain link queue first (priority)
-            drain_link_queue()
-            # 2) if paused → wait
+            # 1) if paused → wait
             if not is_running():
                 time.sleep(3)
                 continue
-            # 3) next playlist
+            # 2) next playlist
             playlist = cfg_get("playlist_url", "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio")
             chat_id = int(cfg_get("chat_id", str(DEFAULT_CHAT)))
             interval = int(cfg_get("interval_sec", "0"))
@@ -203,58 +201,77 @@ def worker_loop():
 def iter_start_time():
     return time.time()
 
-def drain_link_queue():
-    """Process pending link tasks (priority over playlist)."""
-    c = conn()
-    pending = c.execute("SELECT url, chat_id FROM link_queue WHERE status='pending' LIMIT 2").fetchall()
-    c.close()
-    for url, chat_id in pending:
-        c = conn()
-        c.execute("UPDATE link_queue SET status='working' WHERE url=?", (url,))
-        c.commit(); c.close()
-        envelope(f"🎵 شروع پردازش لینک: <code>{url}</code>", chat_id)
-        ok = False
+def link_queue_loop():
+    """Dedicated thread: process link tasks immediately, independent of playlist worker."""
+    ensure_schema()
+    while True:
         try:
-            tmp = tempfile.mkdtemp(prefix="link_")
-            out_tmpl = os.path.join(tmp, "%(title).80s.%(ext)s")
-            r = subprocess.run(["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-                                "--audio-quality", "0", "--embed-metadata", "--write-thumbnail",
-                                "--convert-thumbnails", "jpg", "-o", out_tmpl, url],
-                               capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr[-400:])
-            mp3s = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".mp3")]
-            if not mp3s:
-                raise RuntimeError("no mp3 produced")
-            path = mp3s[0]
-            covers = [os.path.join(tmp, f) for f in os.listdir(tmp)
-                      if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and os.path.getsize(os.path.join(tmp, f)) > 1024]
-            cover = covers[0] if covers else None
-            sz = os.path.getsize(path) / (1024 * 1024)
-            # upload to picofile (always, gives direct full-quality link)
-            pico_url, p_err = picofile.upload_to_picofile(path)
-            if not pico_url:
-                raise RuntimeError(p_err)
-            # send to bale (respects 50MB guard; >50MB → cover+link post)
-            send_to_bale(path, os.path.basename(path), pico_url, 0, cover)
-            msg = f"✅ <b>{os.path.basename(path)}</b>\n📦 {sz:.1f} MB\n🔗 {pico_url}"
-            ok = True
+            drain_link_queue_once()
         except Exception as e:
-            log.exception(f"link task failed: {e}")
-            msg = f"❌ پردازش لینک ناموفق:\n<code>{str(e)[:500]}</code>"
-        finally:
-            try:
-                shutil.rmtree(tmp, ignore_errors=True)
-            except Exception:
-                pass
-        envelope(msg, chat_id)
+            log.exception("link_queue_loop error: %s", e)
+        time.sleep(2)
+
+def drain_link_queue_once():
+    c = conn()
+    pending = c.execute("SELECT url, chat_id FROM link_queue WHERE status='pending' LIMIT 1").fetchall()
+    c.close()
+    if not pending:
+        return
+    url, chat_id = pending[0]
+    c = conn()
+    c.execute("UPDATE link_queue SET status='working' WHERE url=?", (url,))
+    c.commit(); c.close()
+    envelope(f"🎵 شروع پردازش لینک: <code>{url}</code>", chat_id)
+    ok = False
+    try:
+        tmp = tempfile.mkdtemp(prefix="link_")
+        out_tmpl = os.path.join(tmp, "%(title).80s.%(ext)s")
+        r = subprocess.run(["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
+                            "--audio-quality", "0", "--embed-metadata", "--write-thumbnail",
+                            "--convert-thumbnails", "jpg", "-o", out_tmpl, url],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr[-400:])
+        mp3s = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".mp3")]
+        if not mp3s:
+            raise RuntimeError("no mp3 produced")
+        path = mp3s[0]
+        covers = [os.path.join(tmp, f) for f in os.listdir(tmp)
+                  if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and os.path.getsize(os.path.join(tmp, f)) > 1024]
+        cover = covers[0] if covers else None
+        sz = os.path.getsize(path) / (1024 * 1024)
+        # duration probe for nice caption
+        dur = 0
+        try:
+            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+                                capture_output=True, text=True, timeout=15)
+            dur = float(json.loads(pr.stdout).get("format", {}).get("duration", 0))
+        except Exception:
+            pass
+        # upload to picofile (always, gives direct full-quality link)
+        pico_url, p_err = picofile.upload_to_picofile(path)
+        if not pico_url:
+            raise RuntimeError(p_err)
+        # send to bale (respects 50MB guard; >50MB → cover+link post)
+        send_to_bale(path, os.path.basename(os.path.splitext(path)[0]), pico_url, dur, cover)
+        msg = f"✅ <b>{os.path.basename(os.path.splitext(path)[0])}</b>\n📦 {sz:.1f} MB\n🔗 {pico_url}"
+        ok = True
+    except Exception as e:
+        log.exception(f"link task failed: {e}")
+        msg = f"❌ پردازش لینک ناموفق:\n<code>{str(e)[:500]}</code>"
+    finally:
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
+    envelope(msg, chat_id)
+    c = conn()
+    c.execute("UPDATE link_queue SET status='done' WHERE url=?", (url,))
+    c.commit(); c.close()
+    if ok:
         c = conn()
-        c.execute("UPDATE link_queue SET status='done' WHERE url=?", (url,))
+        c.execute("DELETE FROM link_queue WHERE url=?", (url,))
         c.commit(); c.close()
-        if ok:
-            c = conn()
-            c.execute("DELETE FROM link_queue WHERE url=?", (url,))
-            c.commit(); c.close()
 
 # ---------------------------------------------------------------- bot commands
 def cmd_help(chat):
@@ -540,4 +557,5 @@ if __name__ == "__main__":
         cfg_set("running", "0")
     set_running(cfg_get("running", "0") == "1")
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=link_queue_loop, daemon=True).start()
     poll_loop()
