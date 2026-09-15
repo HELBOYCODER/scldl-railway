@@ -187,7 +187,13 @@ def send_to_bale(filepath, title, pico_url, duration_s, cover_path=None):
                     logger.info(f"Cover photo sent (msg {photo_msg_id})")
         except Exception as e:
             logger.warning(f"Cover photo send failed: {e}")
-    # 2) Try to send full audio file directly (no split). If Bale 413, we keep photo post as complete fallback.
+    # 2) Bale hard limit = 50MB (413). If file is larger, the cover+link post above
+    #    IS the complete post (PicoFile holds the untouched full file). Do NOT try to
+    #    upload an oversized file — it always fails with empty body (JSONDecodeError).
+    BALE_LIMIT_MB = 50.0
+    if sz_mb > BALE_LIMIT_MB:
+        logger.warning(f"Bale 50MB limit: skipping audio upload ({sz_mb:.1f}MB) — cover photo + PicoFile full-quality link is the complete post")
+        return photo_msg_id
     try:
         with open(filepath, "rb") as f:
             res = requests.post(
