@@ -182,11 +182,20 @@ def send_to_bale(filepath, title, pico_url, duration_s):
         return d["result"]["message_id"]
     raise RuntimeError(f"Bale send failed: {d.get('description')}")
 
-INTERVAL_SECONDS = 300  # 5-minute scheduled pacing per episode
+INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "0"))  # 0 = zero-delay from start (user asked), was 300
 
 def sync_all():
     init_db()
-    logger.info("=== Starting Automatic Batch Sync Daemon (5-Minute Interval Mode) ===")
+    mode = "ZERO-DELAY lossless" if INTERVAL_SECONDS==0 else f"{INTERVAL_SECONDS}s interval"
+    logger.info(f"=== Starting Automatic Batch Sync Daemon ({mode}) ===")
+    # user asked: zero schedule + restart from beginning with high quality (now)
+    if os.environ.get("RESET_DB", "1") == "1":  # default 1 for this reset deploy
+        try:
+            if os.path.isfile(DB_PATH):
+                os.remove(DB_PATH)
+                logger.info(f"RESET_DB=1 → removed {DB_PATH} to restart from beginning")
+        except Exception as e:
+            logger.warning(f"RESET_DB delete failed: {e}")
     
     entries = get_playlist_entries()
     total = len(entries)
