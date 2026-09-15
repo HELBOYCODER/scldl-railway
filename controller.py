@@ -22,6 +22,22 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import picofile
+import toolschi
+
+
+def upload_best(path):
+    """Upload to toolschi (≤100MB, free) else PicoFile fallback (>100MB).
+    Returns (url, uploader_name)."""
+    sz = os.path.getsize(path) / (1024 * 1024)
+    if sz <= toolschi.MAX_SIZE / (1024 * 1024):
+        url, err = toolschi.upload_to_toolschi(path)
+        if url:
+            return url, "toolschi"
+        log.warning(f"toolschi failed ({err}); falling back to picofile")
+    url, err = picofile.upload_to_picofile(path)
+    if url:
+        return url, "picofile"
+    return None, err
 import sync_playlist  # reuse download_raw_track, send_to_bale, etc.
 from sync_playlist import (
     init_db, is_synced, mark_synced, get_playlist_entries,
@@ -148,11 +164,11 @@ def process_one_entry(entry, idx, total, chat_id, pico_only=False):
         raw_path, title, duration_s, cover_path = download_raw_track(url, tmp_dir)
         raw_size = os.path.getsize(raw_path)
         log.info(f"[{idx}/{total}] raw original: {title} ({raw_size/(1024*1024):.1f} MB)")
-        pico_url, p_err = picofile.upload_to_picofile(raw_path)
+        pico_url, p_err = upload_best(raw_path)
         if not pico_url:
-            log.error(f"[{idx}/{total}] PicoFile error: {p_err}")
+            log.error(f"[{idx}/{total}] Upload error: {p_err}")
             return False, p_err
-        log.info(f"[{idx}/{total}] PicoFile: {pico_url}")
+        log.info(f"[{idx}/{total}] uploaded: {pico_url}")
         bale_msg_id = None
         if not pico_only:
             bale_msg_id = send_to_bale(raw_path, title, pico_url, duration_s, cover_path)
@@ -271,7 +287,7 @@ def drain_link_queue_once():
             dur = float(json.loads(pr.stdout).get("format", {}).get("duration", 0))
         except Exception:
             pass
-        pico_url, p_err = picofile.upload_to_picofile(path)
+        pico_url, p_err = upload_best(path)
         if not pico_url:
             raise RuntimeError(p_err)
         send_to_bale(path, os.path.basename(os.path.splitext(path)[0]), pico_url, dur, cover)
