@@ -185,17 +185,17 @@ def send_to_bale(filepath, title, pico_url, duration_s):
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "0"))  # 0 = zero-delay from start (user asked), was 300
 
 def sync_all():
-    init_db()
-    mode = "ZERO-DELAY lossless" if INTERVAL_SECONDS==0 else f"{INTERVAL_SECONDS}s interval"
-    logger.info(f"=== Starting Automatic Batch Sync Daemon ({mode}) ===")
-    # user asked: zero schedule + restart from beginning with high quality (now)
-    if os.environ.get("RESET_DB", "1") == "1":  # default 1 for this reset deploy
+    # user asked: zero schedule + restart from beginning — RESET before init_db (ponytail: one-time wipe)
+    if os.environ.get("RESET_DB", "1") == "1":
         try:
             if os.path.isfile(DB_PATH):
                 os.remove(DB_PATH)
                 logger.info(f"RESET_DB=1 → removed {DB_PATH} to restart from beginning")
         except Exception as e:
             logger.warning(f"RESET_DB delete failed: {e}")
+    init_db()
+    mode = "ZERO-DELAY lossless" if INTERVAL_SECONDS==0 else f"{INTERVAL_SECONDS}s interval"
+    logger.info(f"=== Starting Automatic Batch Sync Daemon ({mode}) ===")
     
     entries = get_playlist_entries()
     total = len(entries)
@@ -280,11 +280,14 @@ def sync_all():
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        # Scheduled 5-minute pacing (300 seconds)
+        # pacing: 0 = zero-delay start now (user asked), else INTERVAL_SECONDS
         elapsed = time.time() - iter_start
-        wait_sec = max(15, int(INTERVAL_SECONDS - elapsed))
-        logger.info(f"[{idx}/{total}] Episode finished in {elapsed:.1f}s. Sleeping {wait_sec}s for the next 5-minute schedule...")
-        time.sleep(wait_sec)
+        if INTERVAL_SECONDS > 0:
+            wait_sec = max(15, int(INTERVAL_SECONDS - elapsed))
+            logger.info(f"[{idx}/{total}] Finished in {elapsed:.1f}s. Sleeping {wait_sec}s...")
+            time.sleep(wait_sec)
+        else:
+            logger.info(f"[{idx}/{total}] Finished in {elapsed:.1f}s. ZERO-DELAY → next immediately.")
 
     logger.info("=== All episodes have been synced successfully! ===")
 
