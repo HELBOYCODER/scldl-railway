@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 WYM Radio / scldl Control Bot + Worker (single process, Railway)
-- Polls Bale for admin commands (admin-only whitelist)
+- Polls Bale for updates: commands (/...), inline buttons (callback_data), and raw links
+- Auto-detects link type: single track vs playlist/album/set → offers download choice
 - Worker thread downloads playlist episodes → PicoFile (original quality) → Bale post
-- Full control: start/stop, pause/resume, change playlist, goto/skip, link-to-music,
-  send single/group, view playlist, resend from PicoFile, stats, interval, delete/reset
+- Full control via buttons and commands: start/stop/resume, change playlist, goto/skip,
+  link-to-music, send single/group, view playlist, resend from PicoFile, stats, interval
 """
 import os
 import sys
@@ -34,6 +35,7 @@ os.environ["PATH"] = f"{HOME}/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 BALE_TOKEN = os.environ.get("BALE_TOKEN", "1629720660:c-U5awHAgXHUm7XqzR5HjHa4CMRFGmHBilI")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "8874504954").split(",") if x.strip()]
 DEFAULT_CHAT = int(os.environ.get("BALE_CHAT_ID", "1446119540"))
+DEFAULT_PLAYLIST = "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio"
 DB_PATH = os.environ.get("DB_PATH", "/app/data/synced_episodes.db" if os.path.isdir("/app") else "/home/ersaz/scldl-bot/synced_episodes.db")
 try:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -41,8 +43,7 @@ except Exception:
     pass
 
 BOT = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
-_handlers = [logging.StreamHandler(sys.stdout)]
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=_handlers)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("control")
 
 # ---------------------------------------------------------------- db helpers
@@ -67,6 +68,9 @@ def ensure_schema():
     c.execute("""CREATE TABLE IF NOT EXISTS link_queue (
         url TEXT PRIMARY KEY, title TEXT, chat_id INTEGER, status TEXT DEFAULT 'pending',
         msg TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS pending_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT, chat_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     c.execute("""CREATE TABLE IF NOT EXISTS skipped (url TEXT PRIMARY KEY)""")
     c.commit(); c.close()
     init_db()  # synced table
@@ -80,9 +84,26 @@ def is_skipped(url):
 def synced_count():
     c = conn(); r = c.execute("SELECT COUNT(*) FROM synced").fetchone(); c.close(); return r[0] if r else 0
 
-def envelope(text, chat_id, parse_mode="HTML"):
+def store_pending_link(url, chat_id):
+    c = conn()
+    cur = c.execute("INSERT INTO pending_links(url,chat_id) VALUES(?,?)", (url, chat_id))
+    c.commit(); _id = cur.lastrowid; c.close()
+    return _id
+
+def get_pending_link(pid):
+    c = conn(); r = c.execute("SELECT url FROM pending_links WHERE id=?", (pid,)).fetchone(); c.close()
+    return r[0] if r else None
+
+# ---------------------------------------------------------------- bale send helpers
+def inline(rows):
+    return {"inline_keyboard": rows}
+
+def envelope(text, chat_id, parse_mode="HTML", reply_markup=None):
     try:
-        requests.post(f"{BOT}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=30)
+        data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        requests.post(f"{BOT}/sendMessage", data=data, timeout=30)
     except Exception as e:
         log.error(f"sendMessage failed: {e}")
 
@@ -94,6 +115,12 @@ def send_doc(chat_id, path, caption=None):
         return r.json().get("ok"), r.json().get("result", {}).get("message_id")
     except Exception as e:
         return False, str(e)
+
+def answer_cb(cq_id):
+    try:
+        requests.post(f"{BOT}/answerCallbackQuery", data={"callback_query_id": cq_id}, timeout=15)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------- worker state
 _state = {"running": False, "current_link": None, "current_title": None,
@@ -140,23 +167,28 @@ def worker_loop():
     log.info("Worker thread started")
     while True:
         try:
-            # 1) if paused → wait
             if not is_running():
                 time.sleep(3)
                 continue
-            # 2) next playlist
-            playlist = cfg_get("playlist_url", "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio")
+            playlist = cfg_get("playlist_url", DEFAULT_PLAYLIST)
             chat_id = int(cfg_get("chat_id", str(DEFAULT_CHAT)))
             interval = int(cfg_get("interval_sec", "0"))
             entries = get_playlist_entries(playlist)
             total = len(entries)
             with _lock:
                 _state["current_total"] = total
-            log.info(f"Playlist {playlist}: {total} entries")
+            log.info(f"Playlist {playlist[:70]}: {total} entries")
+            changed = False
             for idx, entry in enumerate(entries, 1):
                 if not is_running():
                     set_running(False)
                     log.info("Worker paused/stopped mid-playlist")
+                    break
+                # если playlist changed mid-run → restart from new playlist immediately
+                cur_pl = cfg_get("playlist_url", DEFAULT_PLAYLIST)
+                if cur_pl != playlist:
+                    log.info("Playlist changed mid-run → switching")
+                    changed = True
                     break
                 url = entry.get("url")
                 if not url:
@@ -179,16 +211,10 @@ def worker_loop():
                     with _lock:
                         _state["last_done"] = f"{info['title']} ✅"
                     envelope(f"✅ <b>{info['title']}</b>\n📦 {info['secs']}s\n🔗 {info['pico']}", chat_id)
-                # pacing
-                el = 0
-                try:
-                    st = time.time()
-                except Exception:
-                    st = 0
                 if interval > 0:
-                    left = max(5, int(interval - (time.time() - iter_start_time() if False else 0)))
-                    time.sleep(left if left > 0 else 5)
-            # playlist drained (or all synced)
+                    time.sleep(interval)
+            if changed:
+                continue
             left = [e for e in entries if not is_synced(e.get("url", "")) and not is_skipped(e.get("url", ""))]
             if not left:
                 log.info("All entries done → auto-stop")
@@ -198,11 +224,8 @@ def worker_loop():
             log.exception(f"worker_loop error: {e}")
             time.sleep(10)
 
-def iter_start_time():
-    return time.time()
-
+# ---------------------------------------------------------------- link queue thread
 def link_queue_loop():
-    """Dedicated thread: process link tasks immediately, independent of playlist worker."""
     ensure_schema()
     while True:
         try:
@@ -223,13 +246,14 @@ def drain_link_queue_once():
     c.commit(); c.close()
     envelope(f"🎵 شروع پردازش لینک: <code>{url}</code>", chat_id)
     ok = False
+    tmp = None
     try:
         tmp = tempfile.mkdtemp(prefix="link_")
         out_tmpl = os.path.join(tmp, "%(title).80s.%(ext)s")
         r = subprocess.run(["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
                             "--audio-quality", "0", "--embed-metadata", "--write-thumbnail",
                             "--convert-thumbnails", "jpg", "-o", out_tmpl, url],
-                           capture_output=True, text=True, timeout=600)
+                           capture_output=True, text=True, timeout=900)
         if r.returncode != 0:
             raise RuntimeError(r.stderr[-400:])
         mp3s = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".mp3")]
@@ -240,7 +264,6 @@ def drain_link_queue_once():
                   if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and os.path.getsize(os.path.join(tmp, f)) > 1024]
         cover = covers[0] if covers else None
         sz = os.path.getsize(path) / (1024 * 1024)
-        # duration probe for nice caption
         dur = 0
         try:
             pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
@@ -248,11 +271,9 @@ def drain_link_queue_once():
             dur = float(json.loads(pr.stdout).get("format", {}).get("duration", 0))
         except Exception:
             pass
-        # upload to picofile (always, gives direct full-quality link)
         pico_url, p_err = picofile.upload_to_picofile(path)
         if not pico_url:
             raise RuntimeError(p_err)
-        # send to bale (respects 50MB guard; >50MB → cover+link post)
         send_to_bale(path, os.path.basename(os.path.splitext(path)[0]), pico_url, dur, cover)
         msg = f"✅ <b>{os.path.basename(os.path.splitext(path)[0])}</b>\n📦 {sz:.1f} MB\n🔗 {pico_url}"
         ok = True
@@ -260,10 +281,8 @@ def drain_link_queue_once():
         log.exception(f"link task failed: {e}")
         msg = f"❌ پردازش لینک ناموفق:\n<code>{str(e)[:500]}</code>"
     finally:
-        try:
+        if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
-        except Exception:
-            pass
     envelope(msg, chat_id)
     c = conn()
     c.execute("UPDATE link_queue SET status='done' WHERE url=?", (url,))
@@ -273,10 +292,75 @@ def drain_link_queue_once():
         c.execute("DELETE FROM link_queue WHERE url=?", (url,))
         c.commit(); c.close()
 
+# ---------------------------------------------------------------- link type detection
+def detect_link(url):
+    """Return (kind, count, title) where kind ∈ {'track','playlist'}."""
+    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--no-download", url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout)[-300:])
+    d = json.loads(r.stdout)
+    entries = d.get("entries") or []
+    title = d.get("title") or d.get("id") or url
+    if len(entries) > 1:
+        return "playlist", len(entries), title
+    if len(entries) == 1:
+        # single-entry playlist link (e.g. album page with 1 song) → treat as track
+        return "track", 1, title
+    return "track", 1, title
+
+def handle_incoming_link(text, chat_id):
+    """A raw http(s) link was sent → detect type → offer buttons."""
+    envelope("🔍 در حال تشخیص نوع لینک…", chat_id)
+    try:
+        kind, count, title = detect_link(text)
+    except Exception as e:
+        envelope(f"❌ نتونستم نوع لینک رو تشخیص بدم:\n<code>{str(e)[:250]}</code>", chat_id)
+        return
+    if kind == "playlist":
+        pid = store_pending_link(text, chat_id)
+        kb = inline([
+            [{"text": f"📥 دانلود کل پلی‌لیست ({count} مورد)", "callback_data": f"dl:pl:{pid}"}],
+            [{"text": "🎵 فقط این‌یکی به‌عنوان تک‌آهنگ", "callback_data": f"dl:track:{pid}"}],
+        ])
+        envelope(f"📃 <b>پلی‌لیست/آلبوم تشخیص داده شد</b>\n🎶 <code>{title[:60]}</code>\n🔢 <b>{count}</b> مورد\n\nچه‌کار کنم؟", chat_id, reply_markup=kb)
+    else:
+        pid = store_pending_link(text, chat_id)
+        kb = inline([
+            [{"text": "⬇️ دانلود تک‌آهنگ", "callback_data": f"dl:track:{pid}"}],
+        ])
+        envelope(f"🎵 <b>تک‌آهنگ تشخیص داده شد</b>\n🎶 <code>{title[:60]}</code>\n\nدانلودش کنم؟", chat_id, reply_markup=kb)
+
 # ---------------------------------------------------------------- bot commands
-def cmd_help(chat):
+def cmd_menu(chat_id):
+    kb = inline([
+        [{"text": "▶️ شروع", "callback_data": "m:start"},
+         {"text": "⏸ توقف", "callback_data": "m:stop"},
+         {"text": "🔄 ادامه", "callback_data": "m:resume"}],
+        [{"text": "📊 وضعیت", "callback_data": "m:status"},
+         {"text": "📈 آمار", "callback_data": "m:stats"}],
+        [{"text": "📃 لیست پلی‌لیست", "callback_data": "m:list"},
+         {"text": "🗑 پاک‌کردن همه", "callback_data": "m:reset"}],
+        [{"text": "⏭ رد ۱", "callback_data": "m:skip1"},
+         {"text": "⏭ رد ۵", "callback_data": "m:skip5"},
+         {"text": "⏭ رد ۱۰", "callback_data": "m:skip10"}],
+        [{"text": "⏱ فاصله ۰", "callback_data": "m:int0"},
+         {"text": "⏱ فاصله ۳۰۰", "callback_data": "m:int300"},
+         {"text": "⏱ فاصله ۶۰۰", "callback_data": "m:int600"}],
+        [{"text": "🔗 ارسال لینک", "callback_data": "m:link"},
+         {"text": "📨 تغییر مقصد", "callback_data": "m:chat"},
+         {"text": "📖 راهنما", "callback_data": "m:help"}],
+    ])
     envelope(
-        "🤖 <b>ربات دانلودر ابری</b>\n"
+        "🤖 <b>منوی کنترل ربات</b>\n"
+        "───────\n"
+        "از دکمه‌ها استفاده کن، یا هر لینکی بفرست تا خودم تشخیص بدم تک‌آهنگه یا پلی‌لیست.\n"
+        "دستورات متنی هم فعال‌اند: /start /stop /status /playlist /goto /skip …",
+        chat_id, reply_markup=kb)
+
+def cmd_help(chat_id):
+    env = envelope
+    env("🤖 <b>ربات دانلودر ابری</b>\n"
         "───────\n"
         "🎛 <b>کنترل دانلود:</b>\n"
         "/start — شروع دانلود پلی‌لیست\n"
@@ -290,6 +374,7 @@ def cmd_help(chat):
         "/skip <n> — رد کردن n اپیزود بعدی\n"
         "/reset — پاک‌کردن همه و شروع از اول\n\n"
         "🔗 <b>تبدیل لینک به موزیک:</b>\n"
+        "«هر لینکی بفرست» — خودم تشخیص می‌دم تک‌آهنگ یا پلی‌لیست\n"
         "/link <url> [chat_id] — دانلود و ارسال به تکی/گروه\n"
         "/send <pico_url> — دانلود از پیکوفایل و ارسال مجدد به بله\n"
         "/chat <id> — تغییر مقصد ارسال (تکی یا گروه)\n\n"
@@ -298,7 +383,7 @@ def cmd_help(chat):
         "/stats — آمار سینک‌شده\n"
         "/del <پیکوurl> — حذف از لیست سینک‌شده (دانلود مجدد)\n"
         "/help — این راهنما\n\n"
-        "🔐 فقط مدیر دسترسی دارد", chat)
+        "🔐 فقط مدیر دسترسی دارد", chat_id)
 
 def cmd_status(chat):
     with _lock:
@@ -311,8 +396,10 @@ def cmd_status(chat):
     chat_id = cfg_get("chat_id", str(DEFAULT_CHAT))
     interval = cfg_get("interval_sec", "0")
     n = synced_count()
-    env = envelope
-    env(f"📊 <b>وضعیت ربات</b>\n"
+    kb = inline([[{"text": "▶️ شروع", "callback_data": "m:start"},
+                  {"text": "⏸ توقف", "callback_data": "m:stop"},
+                  {"text": "🔄 ادامه", "callback_data": "m:resume"}]])
+    envelope(f"📊 <b>وضعیت ربات</b>\n"
         f"───────\n"
         f"⏯ وضعیت: {'🟢 در حال دانلود' if running else '🟤 متوقف'}\n"
         f"📃 پلی‌لیست: <code>{playlist[:60]}</code>\n"
@@ -321,7 +408,7 @@ def cmd_status(chat):
         f"✅ سینک‌شده: {n} اپیزود\n"
         f"📨 مقصد: <code>{chat_id}</code>\n"
         f"⏱ فاصله: {interval}s\n"
-        f"🕒 آخرین: {last}", chat)
+        f"🕒 آخرین: {last}", chat, reply_markup=kb)
 
 def cmd_stats(chat):
     n = synced_count()
@@ -332,7 +419,7 @@ def cmd_stats(chat):
     envelope(f"📈 <b>آمار</b>\nسینک‌شده: <b>{n}</b> اپیزود\n───────\nآخرین‌ها:\n{lines}", chat)
 
 def cmd_list(chat):
-    playlist = cfg_get("playlist_url", "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio")
+    playlist = cfg_get("playlist_url", DEFAULT_PLAYLIST)
     try:
         entries = get_playlist_entries(playlist)
     except Exception as e:
@@ -368,7 +455,7 @@ def cmd_goto(chat, n):
         n = int(n)
     except Exception:
         return envelope("عدد بفرست: /goto 5", chat)
-    playlist = cfg_get("playlist_url", "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio")
+    playlist = cfg_get("playlist_url", DEFAULT_PLAYLIST)
     try:
         entries = get_playlist_entries(playlist)
     except Exception as e:
@@ -395,7 +482,7 @@ def cmd_skip(chat, n):
         n = int(n)
     except Exception:
         return envelope("عدد بفرست: /skip 3", chat)
-    playlist = cfg_get("playlist_url", "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio")
+    playlist = cfg_get("playlist_url", DEFAULT_PLAYLIST)
     try:
         entries = get_playlist_entries(playlist)
     except Exception as e:
@@ -465,10 +552,14 @@ def cmd_del(chat, pico_url):
     else:
         envelope("در لیست سینک‌شده پیدا نشد (لینک دقیق /f/…/filename.mp3 بفرست)", chat)
 
+# ---------------------------------------------------------------- command / callback dispatch
 def handle_command(text, chat_id):
     text = text.strip()
     if not text.startswith("/"):
-        envelope("🤖 فقط دستورات / مجاز است. /help", chat_id)
+        if text.startswith("http"):
+            handle_incoming_link(text, chat_id)
+        else:
+            envelope("🤖 فقط دستورات / یا لینک بفرست. /help", chat_id)
         return
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
@@ -482,8 +573,10 @@ def handle_command(text, chat_id):
     elif cmd == "/resume":
         set_running(True)
         envelope("🟢 ادامه دادم!", chat_id)
-    elif cmd == "/help" or cmd == "/start":
-        cmd_help(chat_id)
+    elif cmd in ("/help", "/menu"):
+        cmd_menu(chat_id)
+    elif cmd == "/start":
+        cmd_menu(chat_id)
     elif cmd == "/status":
         cmd_status(chat_id)
     elif cmd == "/stats":
@@ -519,6 +612,59 @@ def handle_command(text, chat_id):
     else:
         envelope("دستور ناشناخته. /help", chat_id)
 
+def handle_callback(data, chat_id):
+    """Callback button presses."""
+    if data.startswith("m:"):
+        m = data[2:]
+        if m == "start":
+            set_running(True); envelope("🟢 دانلود شروع شد!", chat_id)
+        elif m == "stop":
+            set_running(False); envelope("🟤 متوقف شد.", chat_id)
+        elif m == "resume":
+            set_running(True); envelope("🟢 ادامه دادم!", chat_id)
+        elif m == "status":
+            cmd_status(chat_id)
+        elif m == "stats":
+            cmd_stats(chat_id)
+        elif m == "list":
+            cmd_list(chat_id)
+        elif m == "reset":
+            cmd_reset(chat_id)
+        elif m == "help":
+            cmd_help(chat_id)
+        elif m == "skip1": cmd_skip(chat_id, "1")
+        elif m == "skip5": cmd_skip(chat_id, "5")
+        elif m == "skip10": cmd_skip(chat_id, "10")
+        elif m == "int0":
+            cfg_set("interval_sec", "0"); envelope("⏱ فاصله: ۰ (بدون توقف)", chat_id)
+        elif m == "int300":
+            cfg_set("interval_sec", "300"); envelope("⏱ فاصله: ۳۰۰ ثانیه", chat_id)
+        elif m == "int600":
+            cfg_set("interval_sec", "600"); envelope("⏱ فاصله: ۶۰۰ ثانیه", chat_id)
+        elif m == "link":
+            envelope("🔗 لینک آهنگ یا پلی‌لیست رو بفرست — خودم تشخیص می‌دم.", chat_id)
+        elif m == "chat":
+            envelope("📨 آیدی مقصد رو بفرست: <code>/chat 1446119540</code> (عدد منفی = گروه)", chat_id)
+        else:
+            envelope("دکمه ناشناخته.", chat_id)
+    elif data.startswith("dl:track:") or data.startswith("dl:pl:"):
+        try:
+            pid = int(data.split(":")[2])
+            url = get_pending_link(pid)
+        except Exception:
+            envelope("❌ لینک منقضی شده — دوباره بفرست.", chat_id)
+            return
+        if not url:
+            envelope("❌ لینک پیدا نشد — دوباره بفرست.", chat_id)
+            return
+        if data.startswith("dl:track:"):
+            cmd_link(chat_id, url)
+        else:
+            cfg_set("playlist_url", url)
+            set_running(True)
+            envelope(f"📃 پلی‌لیست تنظیم شد و دانلود شروع شد:\n<code>{url[:80]}</code>", chat_id)
+
+# ---------------------------------------------------------------- polling
 def poll_loop():
     ensure_schema()
     offset = 0
@@ -532,6 +678,24 @@ def poll_loop():
                 continue
             for upd in d.get("result", []):
                 offset = upd["update_id"] + 1
+                # callback (button press)
+                cq = upd.get("callback_query")
+                if cq:
+                    cq_id = cq.get("id")
+                    answer_cb(cq_id)
+                    from_id = (cq.get("from") or {}).get("id")
+                    chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id") or from_id
+                    data = cq.get("data") or ""
+                    if from_id not in ADMIN_IDS:
+                        envelope("⛔ فقط مدیر دسترسی دارد", chat_id)
+                        continue
+                    log.info(f"callback from {from_id}: {data[:60]}")
+                    try:
+                        handle_callback(data, chat_id)
+                    except Exception as e:
+                        log.exception("callback error")
+                        envelope(f"❌ خطای داخلی: {str(e)[:200]}", chat_id)
+                    continue
                 msg = upd.get("message") or upd.get("edited_message") or {}
                 chat_id = (msg.get("chat") or {}).get("id")
                 text = (msg.get("text") or "").strip()
