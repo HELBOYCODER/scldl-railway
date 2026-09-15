@@ -97,10 +97,12 @@ def download_raw_track(track_url, tmp_dir):
         "--audio-format", "mp3",
         "--audio-quality", "0",  # Highest bitrate / 100% original quality
         "--embed-metadata",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
         "-o", out_tmpl,
         track_url
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if p.returncode != 0:
         raise RuntimeError(f"Download failed: {p.stderr[-300:]}")
 
@@ -108,6 +110,10 @@ def download_raw_track(track_url, tmp_dir):
     if not files:
         raise RuntimeError("No MP3 file produced")
     raw_path = files[0]
+    # find cover if any
+    covers = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.lower().endswith((".jpg",".jpeg",".webp",".png")) and os.path.getsize(os.path.join(tmp_dir,f))>1024]
+    cover_path = covers[0] if covers else None
+    # if webp keep but Bale prefers jpg — we already converted to jpg
 
     # Get title and metadata
     probe = subprocess.run(
@@ -123,7 +129,7 @@ def download_raw_track(track_url, tmp_dir):
     except Exception:
         pass
 
-    return raw_path, title, duration_s
+    return raw_path, title, duration_s, cover_path
 
 
 def download_from_picofile_resume(pico_url, dest_path, chunk=1024*256):
@@ -150,37 +156,57 @@ def download_from_picofile_resume(pico_url, dest_path, chunk=1024*256):
     os.rename(tmp, dest_path)
     return dest_path
 
-def send_to_bale(filepath, title, pico_url, duration_s):
+def send_to_bale(filepath, title, pico_url, duration_s, cover_path=None):
+    """Send full file without split, with cover as photo post (ponytail: Bale 50MB nginx hard limit — if 413, we keep PicoFile full link + cover photo as complete post)."""
     bale_url = f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendAudio"
     m, s = divmod(int(duration_s), 60)
     h, m = divmod(m, 60)
     dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
+    # detect size for caption
+    try: sz_mb = os.path.getsize(filepath)/(1024*1024)
+    except: sz_mb = 0
     caption = (
         f"🎧 <b>{title}</b>\n"
-        f"⏱ مدت: {dur_str}\n\n"
-        f"📦 <b>دانلود با کیفیت کامل اورجینال (۱۰۸ مگابایت):</b>\n"
+        f"⏱ مدت: {dur_str} • 📦 {sz_mb:.1f} MB\n\n"
+        f"📥 <b>دانلود با کیفیت اصلی (کامل):</b>\n"
         f"{pico_url}\n\n"
-        f"🤖 بازوی @cloudmelodbot"
+        f"🤖 @cloudmelodbot"
     )
-
     filename = os.path.basename(filepath)
-    with open(filepath, "rb") as f:
-        res = requests.post(
-            bale_url,
-            data={
-                "chat_id": BALE_CHAT_ID,
-                "caption": caption,
-                "title": title,
-                "performer": "Cosmic Gate"
-            },
-            files={"audio": (filename, f, "audio/mpeg")},
-            timeout=300
-        )
-    d = res.json()
-    if d.get("ok"):
-        return d["result"]["message_id"]
-    raise RuntimeError(f"Bale send failed: {d.get('description')}")
+    # 1) If cover exists, send it as photo post first (like a complete post)
+    photo_msg_id = None
+    if cover_path and os.path.isfile(cover_path):
+        try:
+            with open(cover_path, "rb") as cf:
+                rr = requests.post(f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendPhoto",
+                    data={"chat_id": BALE_CHAT_ID, "caption": caption, "parse_mode":"HTML"},
+                    files={"photo": (os.path.basename(cover_path), cf, "image/jpeg")}, timeout=60)
+                dd = rr.json()
+                if dd.get("ok"):
+                    photo_msg_id = dd["result"]["message_id"]
+                    logger.info(f"Cover photo sent (msg {photo_msg_id})")
+        except Exception as e:
+            logger.warning(f"Cover photo send failed: {e}")
+    # 2) Try to send full audio file directly (no split). If Bale 413, we keep photo post as complete fallback.
+    try:
+        with open(filepath, "rb") as f:
+            res = requests.post(
+                bale_url,
+                data={"chat_id": BALE_CHAT_ID, "caption": caption, "parse_mode":"HTML", "title": title, "performer": "Cosmic Gate"},
+                files={"audio": (filename, f, "audio/mpeg")}, timeout=600)
+        d = res.json()
+        if d.get("ok"):
+            return d["result"]["message_id"]
+        desc = d.get("description","")
+        if "413" in str(desc) or "too large" in str(desc).lower() or "Request Entity Too Large" in str(desc):
+            logger.warning(f"Bale 413 for full {sz_mb:.1f}MB — keeping cover+link as complete post (PicoFile has full file)")
+            return photo_msg_id  # fallback: photo post is the complete post
+        raise RuntimeError(f"Bale send failed: {desc}")
+    except Exception as e:
+        if "413" in str(e) or "too large" in str(e).lower():
+            logger.warning(f"Bale 413 fallback to cover+link: {e}")
+            return photo_msg_id
+        raise
 
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "0"))  # 0 = zero-delay from start (user asked), was 300
 
@@ -214,7 +240,7 @@ def sync_all():
         tmp_dir = tempfile.mkdtemp(prefix="wym_")
         try:
             # 1. Download RAW uncompressed audio (100+ MB, original quality)
-            raw_path, title, duration_s = download_raw_track(url, tmp_dir)
+            raw_path, title, duration_s, cover_path = download_raw_track(url, tmp_dir)
             raw_size = os.path.getsize(raw_path)
             logger.info(f"[{idx}/{total}] Raw original file: {title} ({raw_size/(1024*1024):.1f} MB)")
 
@@ -227,47 +253,9 @@ def sync_all():
             else:
                 logger.info(f"[{idx}/{total}] PicoFile ORIGINAL quality link: {pico_url}")
 
-            # 3. For Bale: 110MB+ lossless — split with ffmpeg -c copy (<47MB per part), NO re-encode.
-            # Idea you suggested: keep full 110MB on PicoFile, then download/send in parts to Bale so no quality loss.
-            bale_msg_id = None
-            if raw_size > 47 * 1024 * 1024:
-                import math
-                logger.info(f"[{idx}/{total}] Raw >47MB — lossless split via ffmpeg -c copy for Bale (no quality loss)...")
-                try:
-                    pr = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","json",raw_path], capture_output=True, text=True, timeout=15)
-                    _dur = float(json.loads(pr.stdout).get("format",{}).get("duration", duration_s) or duration_s)
-                except Exception:
-                    _dur = duration_s
-                n = max(2, math.ceil(raw_size / (47*1024*1024)))
-                seg = _dur / n if n else _dur
-                parts=[]
-                for i in range(int(n)):
-                    part = os.path.join(tmp_dir, f"part{i+1:02d}.mp3")
-                    # -c copy = zero quality loss, just byte-split on frame boundaries
-                    subprocess.run(["ffmpeg","-y","-ss",str(i*seg),"-t",str(seg),"-i",raw_path,"-c","copy",part], capture_output=True, timeout=120)
-                    if os.path.isfile(part) and os.path.getsize(part)>1024:
-                        parts.append(part)
-                if not parts:
-                    raise RuntimeError("split failed — no parts produced")
-                first_id=None
-                m, s = divmod(int(_dur), 60); h, m = divmod(m, 60)
-                dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-                for pi, part in enumerate(parts, 1):
-                    cap = (f"🎧 <b>{title}</b> — قسمت {pi}/{len(parts)} (کیفیت اصلی بدون افت)\n⏱ مدت: {dur_str}\n\n📦 <b>دانلود کامل اورجینال 110MB+:</b>\n{pico_url}\n\n🤖 @cloudmelodbot")
-                    with open(part,"rb") as f:
-                        rr = requests.post(f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendAudio",
-                            data={"chat_id": BALE_CHAT_ID, "caption": cap, "parse_mode":"HTML", "title": f"{title} p{pi}/{len(parts)}", "performer":"Cosmic Gate"},
-                            files={"audio": (os.path.basename(part), f, "audio/mpeg")}, timeout=300)
-                    dd = rr.json()
-                    if not dd.get("ok"):
-                        raise RuntimeError(f"Bale part {pi} failed: {dd.get('description')}")
-                    mid = dd["result"]["message_id"]
-                    if first_id is None: first_id = mid
-                    logger.info(f"[{idx}/{total}] Bale part {pi}/{len(parts)} sent (msg {mid})")
-                bale_msg_id = first_id
-            else:
-                logger.info(f"[{idx}/{total}] Sending to Bale with original quality link in caption...")
-                bale_msg_id = send_to_bale(raw_path, title, pico_url, duration_s)
+            # 3. Send full file with cover as complete post (no split — user asked)
+            logger.info(f"[{idx}/{total}] Sending full file ({raw_size/(1024*1024):.1f} MB) with cover to Bale...")
+            bale_msg_id = send_to_bale(raw_path, title, pico_url, duration_s, cover_path)
             logger.info(f"[{idx}/{total}] Successfully delivered to Bale! (msg_id: {bale_msg_id})")
 
             # 5. Mark synced in DB
