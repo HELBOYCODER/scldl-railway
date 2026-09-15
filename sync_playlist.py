@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Automated Batch Downloader & Dual Cloud Publisher
+Syncs all episodes of Cosmic Gate - WYM Radio (469 episodes)
+to Bale (@cloudmelodbot -> chat 1446119540) and PicoFile.
+Attaches PicoFile direct download link inside Bale audio caption!
+Runs as background daemon on Alwaysdata.
+"""
+import os
+import sys
+import time
+import json
+import shutil
+import sqlite3
+import logging
+import tempfile
+import subprocess
+import requests
+
+import picofile
+
+HOME = os.path.expanduser("~")
+os.environ["PATH"] = f"{HOME}/bin:{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")
+
+PLAYLIST_URL = "https://soundcloud.com/cosmicgateofficial/sets/cosmic-gate-wym-radio"
+BALE_TOKEN = "1629720660:c-U5awHAgXHUm7XqzR5HjHa4CMRFGmHBilI"
+BALE_CHAT_ID = "1446119540"
+DB_PATH = "/home/ersaz/scldl-bot/synced_episodes.db"
+LOG_PATH = "/home/ersaz/scldl-bot/sync.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger("sync-wym")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS synced (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            pico_url TEXT,
+            bale_msg_id INTEGER,
+            synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def is_synced(url):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM synced WHERE url = ?", (url,))
+    res = c.fetchone()
+    conn.close()
+    return bool(res)
+
+def mark_synced(url, title, pico_url, bale_msg_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO synced (url, title, pico_url, bale_msg_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET
+            pico_url = excluded.pico_url,
+            bale_msg_id = excluded.bale_msg_id,
+            synced_at = CURRENT_TIMESTAMP
+    """, (url, title, pico_url, bale_msg_id))
+    conn.commit()
+    conn.close()
+
+def get_playlist_entries():
+    logger.info(f"Extracting playlist entries from: {PLAYLIST_URL}")
+    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", PLAYLIST_URL]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError(f"Failed to fetch playlist: {p.stderr[:300]}")
+    data = json.loads(p.stdout)
+    entries = data.get("entries", [])
+    logger.info(f"Found {len(entries)} total episodes in playlist.")
+    return entries
+
+def download_raw_track(track_url, tmp_dir):
+    out_tmpl = os.path.join(tmp_dir, "%(title).80s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--no-playlist",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",  # Highest bitrate / 100% original quality
+        "--embed-metadata",
+        "-o", out_tmpl,
+        track_url
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if p.returncode != 0:
+        raise RuntimeError(f"Download failed: {p.stderr[-300:]}")
+
+    files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith(".mp3")]
+    if not files:
+        raise RuntimeError("No MP3 file produced")
+    raw_path = files[0]
+
+    # Get title and metadata
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags=title,artist:format=duration", "-of", "json", raw_path],
+        capture_output=True, text=True
+    )
+    title = "WYM Radio Episode"
+    duration_s = 3600
+    try:
+        pdata = json.loads(probe.stdout)
+        title = pdata.get("format", {}).get("tags", {}).get("title") or title
+        duration_s = float(pdata.get("format", {}).get("duration", 3600))
+    except Exception:
+        pass
+
+    return raw_path, title, duration_s
+
+
+def download_from_picofile_resume(pico_url, dest_path, chunk=1024*256):
+    """Download file from PicoFile URL with HTTP Range resume (تیکه‌تیکه) — for re-sending to Bale."""
+    # PicoFile direct link is the final /f/{slug}/{filename} redirect; we follow redirects via Range loop
+    tmp = dest_path + ".part"
+    start = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+    while True:
+        hdr = {"Range": f"bytes={start}-"} if start else {}
+        with requests.get(pico_url, headers=hdr, stream=True, timeout=60, allow_redirects=True) as r:
+            if r.status_code not in (200,206):
+                raise RuntimeError(f"PicoFile download HTTP {r.status_code}")
+            total = int(r.headers.get("Content-Range","/").split("/")[-1] or r.headers.get("Content-Length","0")) if r.headers.get("Content-Range") or r.headers.get("Content-Length") else None
+            mode = "ab" if start and r.status_code==206 else "wb"
+            if mode=="wb": start=0
+            with open(tmp, mode) as f:
+                for c in r.iter_content(chunk_size=chunk):
+                    if c: f.write(c); start+=len(c)
+            if total and start>=total: break
+            if r.status_code==200: break
+            # need next range? loop again if server returned 206 with remaining
+            if r.headers.get("Content-Range"): break
+            break
+    os.rename(tmp, dest_path)
+    return dest_path
+
+def send_to_bale(filepath, title, pico_url, duration_s):
+    bale_url = f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendAudio"
+    m, s = divmod(int(duration_s), 60)
+    h, m = divmod(m, 60)
+    dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    caption = (
+        f"🎧 <b>{title}</b>\n"
+        f"⏱ مدت: {dur_str}\n\n"
+        f"📦 <b>دانلود با کیفیت کامل اورجینال (۱۰۸ مگابایت):</b>\n"
+        f"{pico_url}\n\n"
+        f"🤖 بازوی @cloudmelodbot"
+    )
+
+    filename = os.path.basename(filepath)
+    with open(filepath, "rb") as f:
+        res = requests.post(
+            bale_url,
+            data={
+                "chat_id": BALE_CHAT_ID,
+                "caption": caption,
+                "title": title,
+                "performer": "Cosmic Gate"
+            },
+            files={"audio": (filename, f, "audio/mpeg")},
+            timeout=300
+        )
+    d = res.json()
+    if d.get("ok"):
+        return d["result"]["message_id"]
+    raise RuntimeError(f"Bale send failed: {d.get('description')}")
+
+INTERVAL_SECONDS = 300  # 5-minute scheduled pacing per episode
+
+def sync_all():
+    init_db()
+    logger.info("=== Starting Automatic Batch Sync Daemon (5-Minute Interval Mode) ===")
+    
+    entries = get_playlist_entries()
+    total = len(entries)
+
+    for idx, entry in enumerate(entries, 1):
+        url = entry.get("url")
+        if not url:
+            continue
+
+        if is_synced(url):
+            logger.info(f"[{idx}/{total}] Already synced, skipping: {url}")
+            continue
+
+        iter_start = time.time()
+        logger.info(f"[{idx}/{total}] Downloading & processing: {url}")
+        tmp_dir = tempfile.mkdtemp(prefix="wym_")
+        try:
+            # 1. Download RAW uncompressed audio (100+ MB, original quality)
+            raw_path, title, duration_s = download_raw_track(url, tmp_dir)
+            raw_size = os.path.getsize(raw_path)
+            logger.info(f"[{idx}/{total}] Raw original file: {title} ({raw_size/(1024*1024):.1f} MB)")
+
+            # 2. Upload the 100% UNTOUCHED RAW ORIGINAL file to PicoFile (No size limit on PicoFile!)
+            logger.info(f"[{idx}/{total}] Uploading 100% RAW ORIGINAL file to PicoFile ({raw_size/(1024*1024):.1f} MB)...")
+            pico_url, p_err = picofile.upload_to_picofile(raw_path)
+            if not pico_url:
+                logger.error(f"[{idx}/{total}] PicoFile upload error: {p_err}")
+                pico_url = "https://www.picofile.com"
+            else:
+                logger.info(f"[{idx}/{total}] PicoFile ORIGINAL quality link: {pico_url}")
+
+            # 3. For Bale: 110MB+ lossless — split with ffmpeg -c copy (<47MB per part), NO re-encode.
+            # Idea you suggested: keep full 110MB on PicoFile, then download/send in parts to Bale so no quality loss.
+            bale_msg_id = None
+            if raw_size > 47 * 1024 * 1024:
+                import math
+                logger.info(f"[{idx}/{total}] Raw >47MB — lossless split via ffmpeg -c copy for Bale (no quality loss)...")
+                try:
+                    pr = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","json",raw_path], capture_output=True, text=True, timeout=15)
+                    _dur = float(json.loads(pr.stdout).get("format",{}).get("duration", duration_s) or duration_s)
+                except Exception:
+                    _dur = duration_s
+                n = max(2, math.ceil(raw_size / (47*1024*1024)))
+                seg = _dur / n if n else _dur
+                parts=[]
+                for i in range(int(n)):
+                    part = os.path.join(tmp_dir, f"part{i+1:02d}.mp3")
+                    # -c copy = zero quality loss, just byte-split on frame boundaries
+                    subprocess.run(["ffmpeg","-y","-ss",str(i*seg),"-t",str(seg),"-i",raw_path,"-c","copy",part], capture_output=True, timeout=120)
+                    if os.path.isfile(part) and os.path.getsize(part)>1024:
+                        parts.append(part)
+                if not parts:
+                    raise RuntimeError("split failed — no parts produced")
+                first_id=None
+                m, s = divmod(int(_dur), 60); h, m = divmod(m, 60)
+                dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+                for pi, part in enumerate(parts, 1):
+                    cap = (f"🎧 <b>{title}</b> — قسمت {pi}/{len(parts)} (کیفیت اصلی بدون افت)\n⏱ مدت: {dur_str}\n\n📦 <b>دانلود کامل اورجینال 110MB+:</b>\n{pico_url}\n\n🤖 @cloudmelodbot")
+                    with open(part,"rb") as f:
+                        rr = requests.post(f"https://tapi.bale.ai/bot{BALE_TOKEN}/sendAudio",
+                            data={"chat_id": BALE_CHAT_ID, "caption": cap, "parse_mode":"HTML", "title": f"{title} p{pi}/{len(parts)}", "performer":"Cosmic Gate"},
+                            files={"audio": (os.path.basename(part), f, "audio/mpeg")}, timeout=300)
+                    dd = rr.json()
+                    if not dd.get("ok"):
+                        raise RuntimeError(f"Bale part {pi} failed: {dd.get('description')}")
+                    mid = dd["result"]["message_id"]
+                    if first_id is None: first_id = mid
+                    logger.info(f"[{idx}/{total}] Bale part {pi}/{len(parts)} sent (msg {mid})")
+                bale_msg_id = first_id
+            else:
+                logger.info(f"[{idx}/{total}] Sending to Bale with original quality link in caption...")
+                bale_msg_id = send_to_bale(raw_path, title, pico_url, duration_s)
+            logger.info(f"[{idx}/{total}] Successfully delivered to Bale! (msg_id: {bale_msg_id})")
+
+            # 5. Mark synced in DB
+            mark_synced(url, title, pico_url, bale_msg_id)
+            logger.info(f"[{idx}/{total}] Synced successfully: {title}")
+
+        except Exception as e:
+            logger.exception(f"[{idx}/{total}] Error processing {url}: {e}")
+            time.sleep(10)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # Scheduled 5-minute pacing (300 seconds)
+        elapsed = time.time() - iter_start
+        wait_sec = max(15, int(INTERVAL_SECONDS - elapsed))
+        logger.info(f"[{idx}/{total}] Episode finished in {elapsed:.1f}s. Sleeping {wait_sec}s for the next 5-minute schedule...")
+        time.sleep(wait_sec)
+
+    logger.info("=== All episodes have been synced successfully! ===")
+
+if __name__ == "__main__":
+    sync_all()

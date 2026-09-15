@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  scldl:
+    build: .
+    environment:
+      - BALE_TOKEN=${BALE_TOKEN}
+      - BALE_CHAT_ID=${BALE_CHAT_ID}
+      - PICO_USER=${PICO_USER:-}
+      - PICO_PASS=${PICO_PASS:-}
+    restart: unless-stopped
